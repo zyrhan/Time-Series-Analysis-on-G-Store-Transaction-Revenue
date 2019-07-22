@@ -1,1 +1,1 @@
-# Time-Series-Analysis-on-G-Store-Transaction-Revenue
+# Transaction Revenue Prediction (Regression and Time Series Analysis) of Google Store
