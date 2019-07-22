@@ -1,0 +1,432 @@
+---
+title: "models"
+author: "Zhenru Han"
+date: "4/25/2019"
+output: html_document
+---
+
+
+```{r library}
+library(h2o)
+library(caret)
+library(lme4)
+library(xgboost)
+library(jsonlite)
+library(lubridate)
+library(knitr)
+library(Rmisc)
+library(scales)
+library(glmnet)
+library(keras)
+library(forecast)
+library(zoo)
+library(magrittr)
+library(tidyverse)
+library(data.table)
+library(stringr)
+library(dplyr)
+library(DT)
+library(ModelMetrics)
+library(nlme)
+```
+
+
+```{r read data}
+tr <- fread("train.min.csv",verbose = F)
+te <- fread("test.min.csv",verbose = F)
+
+## Change date in both dt into date format
+tr1 <- copy(tr)
+te1 <- copy(te)
+
+tr[, date := as.Date(format(date, format = "%Y%m%d"), format = "%Y%m%d")]
+te[, date := as.Date(format(date, format = "%Y%m%d"), format = "%Y%m%d")]
+
+## Change revenue back to original
+tr[, transactionRevenue:= expm1(transactionRevenue)/(10^6)]
+te[, transactionRevenue:= expm1(transactionRevenue)/(10^6)]
+
+
+datatable(head(tr))
+datatable(head(te))
+
+```
+
+### Check Normality of Transaction Revenue
+```{r}
+dist.values <- tr[,transactionRevenue]
+dist.values <- dist.values[which(is.na(dist.values) == F)]
+dist <- as.data.table(table(log1p(dist.values*1000000)))
+library(ggplot2)
+dist.plot <- ggplot(data=dist, aes(as.numeric(dist$V1)))
+dist.plot + 
+  geom_histogram(breaks=seq(9, 25, by=0.5), col="coral", 
+                 fill="light pink", 
+                 alpha = .6) +
+  labs(title="Histogram for Log Transaction Revenue", x="Log Revenue", y="Count") + 
+  xlim(c(9,25)) +
+  theme(panel.background = element_rect(fill = "#f0f2f0")
+        ,plot.background = element_rect(fill = "#f0f2f0")
+        ,panel.grid = element_blank()
+        ,plot.title = element_text(size = 20)
+
+        )
+  
+```
+
+
+
+### Model Preparation
+```{r model preparation}
+grp_mean <- function(x, grp) ave(x, grp, FUN = function(x) mean(x, na.rm = TRUE))
+
+idx <- tr$date < ymd("20170515") #
+id <- te[, "fullVisitorId"]
+tri <- 1:nrow(tr)
+
+
+### When analyzing the data, change all True and False to indicator variables, and seperate the date into year wday and hours
+
+### Remove all ids since they are no longer useful for model building
+
+tr_te <- tr %>%
+  bind_rows(te) %>% 
+  mutate(year = year(date) %>% factor(),
+         wday = wday(date) %>% factor(),
+         hour = hour(as_datetime(visitStartTime)) %>% factor(),
+         isMobile = ifelse(isMobile, 1L, 0L),
+         isTrueDirect = ifelse(isTrueDirect, 1L, 0L),
+         adwordsClickInfo.isVideoAd = ifelse(!adwordsClickInfo.isVideoAd, 0L, 1L)) %>% 
+  select(-date, -fullVisitorId, -visitId, -sessionId, -hits, -visitStartTime) %>% 
+  mutate_if(is.character, factor) %>% 
+  mutate(pageviews_mean_vn = grp_mean(pageviews, visitNumber),
+         pageviews_mean_country = grp_mean(pageviews, country),
+         pageviews_mean_city = grp_mean(pageviews, city),
+         pageviews_mean_dom = grp_mean(pageviews, networkDomain),
+         pageviews_mean_ref = grp_mean(pageviews, referralPath)) 
+
+## Show the updated version
+datatable(head(tr_te))
+```
+
+
+GLMNET
+
+```{r}
+tr_te1 <- copy(tr_te)
+
+
+tr_te$visits <- as.numeric(tr_te$visits)
+unique(tr_te$visits) #only 1, remove this column
+tr_te$visits <- NULL
+
+y.all <- tr_te$transactionRevenue
+#tr_te$transactionRevenue <- NULL
+y.all[is.na(y.all)] <- 0
+
+y <- y.all[tri]
+y_test <- y.all[-tri]
+
+
+tr_te_ohe1 <- tr_te %>% 
+  mutate_if(is.factor, fct_explicit_na) %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0L, .))) %>% 
+  mutate_if(is.factor, fct_lump, prop = 0.05) %>% 
+  select(-adwordsClickInfo.isVideoAd)  
+```
+
+
+### PCA
+```{r PCA, eval=FALSE}
+pca <- copy(tr_te_ohe1)
+pca$transactionRevenue <- NULL
+pca.names <- colnames(pca)
+str(pca) #1,3,4,6,7,8,9,10,11,12,13,17-20,22,23,25-30
+
+dummy.names <- pca.names[c(1,3,4,seq(6,13),seq(17,20),22,23,seq(25,30))]
+
+### Set indicators
+library(dummies)
+library(FactoMineR)
+pca.dummy <- dummy.data.frame(pca, names = c(dummy.names))
+
+#test <- PCA(pca.dummy, scale.unit=TRUE, ncp=5, graph=T)
+
+
+#dimdesc(pca)
+
+#pca.test <- pca.dummy[,1:90]
+
+
+
+#pca.train <- pca.dummy[tri,]
+#pca.test <- pca.dummy[-tri,]
+
+
+prin_comp <- prcomp(pca.dummy)
+saveRDS(object = prin_comp, file = "prin_comp.rds")
+```
+
+```{r PCA features, eval = TRUE}
+prin_comp <- readRDS(file = "prin_comp.rds") 
+summary.pca <- summary(prin_comp)
+summary.pca
+0.4334+0.3928+0.05946+0.03382+0.01938 +0.01102
+# First 6 features explain the data 95%
+
+```
+
+
+```{r PCA feature selection}
+pca_df <- data.frame(prin_comp$x)
+pca_df_select <- pca_df[,1:6]
+pca_df_select$y <- y.all
+```
+
+### GLM with feature selection
+```{r PCA ridge}
+tr_te_pca <- pca_df_select %>%
+  model.matrix(y~.-1, .) %>% 
+  scale() %>% 
+  round(4)
+X.pca <- tr_te_pca[tri, ]
+X.pca_test <- tr_te_pca[-tri, ]
+
+```
+
+
+
+
+```{r}
+set.seed(908)
+m.pca_glm <- cv.glmnet(X.pca, log1p(y), alpha = 1, family="gaussian", 
+                   type.measure = "mse", nfolds = 5)
+saveRDS(object =m.pca_glm, file = "m.pca_glm.rds")
+```
+
+
+```{r}
+m.pca_glm <- readRDS(file = "m.pca_glm.rds")
+
+pred_pca.glm_tr <- predict(m.pca_glm, X.pca, s = "lambda.min") %>% c()
+
+pred_pca.glm <- predict(m.pca_glm, X.pca_test, s = "lambda.min") %>% c()
+
+pred_pca_reverse <- expm1(pred_pca.glm)
+
+### Best rmse
+rmse_pca.ridge <- sqrt(m.pca_glm$cvm[m.pca_glm$lambda == min(m.pca_glm$lambda)]) #0.4251
+mse_pca.ridge <- m.pca_glm$cvm[m.pca_glm$lambda == min(m.pca_glm$lambda)]
+#not better
+
+
+max(pred_pca_reverse)
+
+
+
+
+```
+
+### Visualization
+
+```{r}
+
+tr.pca.glm.pred.rev <- expm1(pred_pca.glm_tr)
+tr.pca.glm.pred.rev
+
+pred_pca_reverse <- data.table(date = te$date, pred_pca_reverse)
+
+
+```
+
+
+
+### GLM without feature selection
+```{r glm}
+
+
+
+tr_te_ohe <- tr_te_ohe1%>%
+  model.matrix(transactionRevenue~.-1, .) %>% 
+  scale() %>% 
+  round(4)
+
+#cor.glm <- cor(tr_te_ohe, method = "pearson")
+#cor.glm.high <- copy(cor.glm)
+#cor.names <- c(colnames(cor.glm.high))
+
+#cor.glm.high <- as.data.table(cor.glm.high)
+
+
+#test <- ifelse(abs(cor.glm.high) >= 0.7, cor.glm.high, NA)
+#test1 <- ifelse(abs(test) != 1, cor.glm.high, NA)
+#test2 <- test1[, colSums(is.na(test1)) != nrow(test1)]
+
+X <- tr_te_ohe[tri, ]
+X_test <- tr_te_ohe[-tri, ]
+
+
+```
+
+
+
+
+```{r lasso, eval = FALSE}
+## Set up cross validation #Lasso
+set.seed(908)
+m_lasso <- cv.glmnet(X, log1p(y), alpha = 0, family="gaussian", 
+                   type.measure = "mse", nfolds = 5)
+
+saveRDS(object =m_lasso, file = "m_lasso.rds")
+
+```
+
+```{r, eval= TRUE}
+m_lasso <- readRDS("m_lasso.rds")
+### Best rmse
+rmse_lasso <- sqrt(m_lasso$cvm[m_lasso$lambda == min(m_lasso$lambda)]) #0.4219
+mse_lasso <- m_lasso$cvm[m_lasso$lambda == min(m_lasso$lambda)] #0.1780
+### Best Rsquare
+rsq_lasso = 1 - m_lasso$cvm[m_lasso$lambda == min(m_lasso$lambda)]/var(log1p(y))
+
+```
+
+
+```{r}
+pred_lasso_tr <- predict(m_lasso, X, s = "lambda.min") %>% c()
+
+pred_lasso <- predict(m_lasso, X_test, s = "lambda.min") %>% c()
+
+pred_lasso_reverse <- expm1(pred_lasso)
+max(pred_lasso_reverse)
+```
+
+### Check Ridge
+
+```{r ridge, eval = FALSE}
+## Set up cross validation #ridge
+set.seed(908)
+m_ridge <- cv.glmnet(X, log1p(y), alpha = 1, family="gaussian", 
+                   type.measure = "mse", nfolds = 5)
+saveRDS(object =m_ridge, file = "m_ridge.rds")
+
+```
+
+```{r}
+m_ridge <- readRDS("m_ridge.rds")
+### Best rmse
+rmse_ridge <- sqrt(m_ridge$cvm[m_ridge$lambda == min(m_ridge$lambda)]) #0.4212
+mse_ridge <- m_ridge$cvm[m_ridge$lambda == min(m_ridge$lambda)]
+### Best Rsquare
+rsq_ridge = 1 - m_ridge$cvm[m_ridge$lambda == min(m_ridge$lambda)]/var(log1p(y))
+
+```
+
+
+```{r}
+pred_ridge_tr <- predict(m_ridge, X, s = "lambda.min") %>% c()
+
+pred_ridge <- predict(m_ridge, X_test, s = "lambda.min") %>% c()
+
+pred_ridge_reverse <- expm1(pred_ridge)
+max(pred_ridge_reverse)
+```
+
+
+
+### XGB 
+
+```{r xgb, eval = FALSE}
+tr_te_xgb <- tr_te_ohe1 %>% 
+  mutate_if(is.factor, as.integer) 
+
+tr_te_xgb$transactionRevenue <- NULL
+
+dtest <- xgb.DMatrix(data = data.matrix(tr_te_xgb[-tri, ]))
+tr_te_xgb <- tr_te_xgb[tri, ]
+
+dtr <- xgb.DMatrix(data = data.matrix(tr_te_xgb[idx, ]), label = log1p(y[idx]))
+dval <- xgb.DMatrix(data = data.matrix(tr_te_xgb[!idx, ]), label = log1p(y[!idx]))
+dtrain <- xgb.DMatrix(data = data.matrix(tr_te_xgb), label = log1p(y))
+cols <- colnames(tr_te_xgb)
+
+p <- list(objective = "reg:linear",
+          booster = "gbtree",
+          eval_metric = "rmse",
+          nthread = 4,
+          eta = 0.05,
+          max_depth = 7,
+          min_child_weight = 5,
+          gamma = 0,
+          subsample = 0.8,
+          colsample_bytree = 0.7,
+          colsample_bylevel = 0.6,
+          nrounds = 2000)
+
+set.seed(908)
+m_xgb <- xgb.train(p, dtr, p$nrounds, list(val = dval), print_every_n = 100, early_stopping_rounds = 100) #0.397213
+
+saveRDS(object =m_xgb, file = "m_xgb.rds") 
+```
+
+```{r xgb result, eval = TRUE}
+m_xgb <- readRDS("m_xgb.rds")
+
+m_xgb$best_iteration
+m_xgb$best_score
+mse_xgb <- m_xgb$best_score^2
+
+xgb.importance(cols, model = m_xgb) %>% 
+  xgb.plot.importance(top_n = 25)
+```
+
+
+```{r}
+pred_xgb_tr <- predict(m_xgb, dtrain)
+
+
+pred_xgb <- predict(m_xgb, dtest)
+
+
+pred_xgb_reverse <- expm1(pred_xgb)
+max(pred_xgb_reverse)
+
+```
+
+```{r pred csv}
+
+pred_reverse <- data.table(date = te$date, pred_pca_reverse, pred_ridge_reverse,pred_lasso_reverse,pred_xgb_reverse)
+
+write.csv(pred_reverse, "predictions_models.csv")
+```
+
+
+## Distributions of predictions
+Let's compare predictions for the train set:
+```{r pr_cmp0, result='asis', message=FALSE, warning=FALSE, echo=FALSE}
+tibble(ridge.pca = pred_pca.glm_tr, ridge = pred_ridge_tr, lasso = pred_lasso_tr, xgb = pred_xgb_tr, y = log1p(y)) %>% 
+  mutate_all(funs(ifelse(. < 0, 0, .))) %>% 
+  gather() %>% 
+  ggplot(aes(x=value, fill=key)) +
+  geom_histogram(binwidth = .05, alpha=.6, position="identity") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  facet_grid(key~.,  scales = "free", space = "fixed") +
+  scale_x_continuous(limits = c(-0.05, 3))+
+  labs(x = "predictions on train")
+```
+
+Prediction on Test
+```{r pr_cmp2, result='asis', message=FALSE, warning=FALSE, echo=FALSE}
+pred_avg <- (pred_pca.glm+pred_xgb+pred_ridge+pred_lasso)/4
+tibble(ridge.pca = pred_pca.glm, xgb = pred_xgb, ridge = pred_ridge, lasso = pred_lasso, avg = pred_avg) %>% 
+  mutate_all(funs(ifelse(. < 0, 0, .))) %>% 
+  gather() %>% 
+  ggplot(aes(x=value, fill=key)) +
+  geom_histogram(binwidth = .05, alpha=.6, position="identity") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  facet_grid(key~.,  scales = "free", space = "fixed") +
+  scale_x_continuous(limits = c(-0.05, 3))+
+  labs(x = "predictions on test")
+```
